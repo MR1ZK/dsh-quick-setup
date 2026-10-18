@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Quick Setup (dsh-quick-setup)",
+    "description": "Export third-party DSH plugins as a portable pack, validate DSH/Node/platform compatibility on another instance, and batch-install them."
+  }
+}

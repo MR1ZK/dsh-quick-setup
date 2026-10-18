@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "快速安装 (dsh-quick-setup)",
+    "description": "把本机第三方 DSH 插件导出为插件包，在另一实例校验 DSH/Node/平台兼容性后批量安装。"
+  }
+}

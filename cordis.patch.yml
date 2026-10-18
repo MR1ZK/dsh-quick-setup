@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-quick-setup
+      name: dsh-quick-setup
+      config: {}
