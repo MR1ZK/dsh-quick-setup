@@ -19,6 +19,11 @@ window.__ModuleLoader__.load({
         exportTitle: '导出本机插件',
         exportHint: '官方内置插件和 dsh-quick-setup 自身不会被导出。',
         exportEmpty: '本机没有可导出的第三方插件。',
+        infoOnly: '仅导出插件信息',
+        includeVersion: '包含当前版本号',
+        infoOnlyHint:
+          '导出为 .plugins.txt 文本，只写入包名和版本号，不含插件代码；导入时逐个从 npm 安装。',
+        exportInfoAction: '导出插件信息',
         selectAll: '全选',
         selectNone: '全不选',
         selected: '已选 {count} 个',
@@ -26,8 +31,8 @@ window.__ModuleLoader__.load({
         loading: '正在读取插件列表…',
         importTitle: '导入插件包',
         importHint:
-          '插件包只包含插件代码，不包含账号、密钥、聊天记录或设置。导入时会重新校验 DSH 版本、Node 版本与平台。',
-        chooseFile: '选择 .dshpack.tgz',
+          '支持 .dshpack.tgz 插件包和 .plugins.txt 插件信息清单。插件包只包含插件代码，不包含账号、密钥、聊天记录或设置；兼容性会在导入时重新校验。',
+        chooseFile: '选择 .dshpack.tgz 或 .plugins.txt',
         noFile: '尚未选择文件',
         checkAction: '检查兼容性',
         uploading: '正在解包并校验兼容性…',
@@ -38,6 +43,11 @@ window.__ModuleLoader__.load({
         countIncompatible: '不兼容 {count}',
         countInstalled: '已安装 {count}',
         countSkipped: '跳过 {count}',
+        countInvalid: '无效 {count}',
+        countLatest: 'latest {count}',
+        infoImportHint:
+          '这是一份插件信息清单：导入时逐个从 npm 安装，清单未记录版本号的条目安装 latest；兼容性由官方安装流程校验。',
+        infoInstallHint: '安装会调用 DSH 官方插件管理器，从 npm 逐个下载并安装。',
         currentVersion: '当前 {version}',
         installAction: '安装选中的 {count} 个插件',
         installHint: '安装会调用 DSH 官方的插件管理器，并逐条报告结果。',
@@ -67,6 +77,9 @@ window.__ModuleLoader__.load({
         downgradeBadge: '降级',
         conflictBadge: '版本冲突',
         syncBadge: '同步状态',
+        latestBadge: 'latest',
+        invalidBadge: '无效',
+        listKind: '插件信息清单',
         packMeta: '{count} 个插件 · {size}',
         close: '关闭',
       },
@@ -82,6 +95,11 @@ window.__ModuleLoader__.load({
         exportTitle: 'Export plugins from this instance',
         exportHint: 'Official built-in bundles and dsh-quick-setup itself are not exported.',
         exportEmpty: 'No third-party plugins are available to export.',
+        infoOnly: 'Export plugin info only',
+        includeVersion: 'Include current version',
+        infoOnlyHint:
+          'Writes a .plugins.txt text with package names and versions only — no plugin code. Import installs each entry from npm.',
+        exportInfoAction: 'Export plugin info',
         selectAll: 'Select all',
         selectNone: 'Select none',
         selected: '{count} selected',
@@ -89,8 +107,8 @@ window.__ModuleLoader__.load({
         loading: 'Reading installed plugins…',
         importTitle: 'Import a plugin pack',
         importHint:
-          'A pack contains plugin code only — no accounts, secrets, conversations or settings. Compatibility is re-checked on import.',
-        chooseFile: 'Choose .dshpack.tgz',
+          'Accepts .dshpack.tgz packs and .plugins.txt lists. A pack contains plugin code only — no accounts, secrets, conversations or settings. Compatibility is re-checked on import.',
+        chooseFile: 'Choose .dshpack.tgz or .plugins.txt',
         noFile: 'No file selected',
         checkAction: 'Check compatibility',
         uploading: 'Unpacking and checking compatibility…',
@@ -101,6 +119,11 @@ window.__ModuleLoader__.load({
         countIncompatible: '{count} incompatible',
         countInstalled: '{count} installed',
         countSkipped: '{count} skipped',
+        countInvalid: '{count} invalid',
+        countLatest: '{count} latest',
+        infoImportHint:
+          'This is a plugin info list: each entry is installed from npm, and entries without a version install the latest tag. The official install flow checks compatibility.',
+        infoInstallHint: 'Installs go through the official DSH plugin manager, one npm package at a time.',
         currentVersion: 'current {version}',
         installAction: 'Install {count} selected plugins',
         installHint: 'Installs go through the official DSH plugin manager and are reported one by one.',
@@ -130,6 +153,9 @@ window.__ModuleLoader__.load({
         downgradeBadge: 'downgrade',
         conflictBadge: 'version conflict',
         syncBadge: 'sync state',
+        latestBadge: 'latest',
+        invalidBadge: 'invalid',
+        listKind: 'Plugin info list',
         packMeta: '{count} plugins · {size}',
         close: 'Close',
       },
@@ -207,6 +233,9 @@ window.__ModuleLoader__.load({
       },
       rowFirst: { borderTop: 'none' },
       check: { marginTop: 2, width: 15, height: 15, accentColor: 'var(--dsw-alias-label-primary, #1f2329)' },
+      options: { display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', paddingTop: 2 },
+      option: { display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 12.5 },
+      optionCheck: { margin: 0, width: 15, height: 15, accentColor: 'var(--dsw-alias-label-primary, #1f2329)' },
       nameLine: { display: 'flex', alignItems: 'baseline', gap: 7, flexWrap: 'wrap', minWidth: 0 },
       name: { fontWeight: 600, fontSize: 13, overflowWrap: 'anywhere' },
       version: {
@@ -312,6 +341,8 @@ window.__ModuleLoader__.load({
           return { kind: 'muted', label: t('selfBadge') };
         case 'not-bundle':
           return { kind: 'err', label: t('notBundleBadge') };
+        case 'invalid':
+          return { kind: 'err', label: t('invalidBadge') };
         default:
           return { kind: 'muted', label: status };
       }
@@ -355,6 +386,8 @@ window.__ModuleLoader__.load({
       const [env, setEnv] = React.useState(null);
       const [plugins, setPlugins] = React.useState([]);
       const [selected, setSelected] = React.useState(() => new Set());
+      const [infoOnly, setInfoOnly] = React.useState(false);
+      const [withVersion, setWithVersion] = React.useState(true);
       const [loading, setLoading] = React.useState(true);
       const [error, setError] = React.useState(null);
       const [file, setFile] = React.useState(null);
@@ -418,9 +451,13 @@ window.__ModuleLoader__.load({
         setError(null);
         setJob(null);
         try {
+          const isText = /\.txt$/i.test(file.name) || String(file.type || '').startsWith('text/');
           const data = await fetch(`${API}/upload`, {
             method: 'POST',
-            headers: { 'content-type': 'application/gzip', 'x-dsh-quick-setup': '1' },
+            headers: {
+              'content-type': isText ? 'text/plain; charset=utf-8' : 'application/gzip',
+              'x-dsh-quick-setup': '1',
+            },
             body: file,
           }).then(readJson);
           setUploadId(data.uploadId);
@@ -446,6 +483,10 @@ window.__ModuleLoader__.load({
         }
         const params = new URLSearchParams();
         for (const name of selected) params.append('plugin', name);
+        if (infoOnly) {
+          params.set('mode', 'info');
+          params.set('withVersion', withVersion ? '1' : '0');
+        }
         window.location.assign(`${API}/export?${params.toString()}`);
       }
 
@@ -644,6 +685,35 @@ window.__ModuleLoader__.load({
                 ),
           h(
             'div',
+            { style: styles.options },
+            h(
+              'label',
+              { style: styles.option },
+              h('input', {
+                type: 'checkbox',
+                style: styles.optionCheck,
+                checked: infoOnly,
+                onChange: (event) => setInfoOnly(event.target.checked),
+              }),
+              t('infoOnly'),
+            ),
+            infoOnly
+              ? h(
+                  'label',
+                  { style: styles.option },
+                  h('input', {
+                    type: 'checkbox',
+                    style: styles.optionCheck,
+                    checked: withVersion,
+                    onChange: (event) => setWithVersion(event.target.checked),
+                  }),
+                  t('includeVersion'),
+                )
+              : null,
+            infoOnly ? h('span', { style: styles.muted }, t('infoOnlyHint')) : null,
+          ),
+          h(
+            'div',
             { style: styles.footer },
             h(
               'button',
@@ -665,7 +735,7 @@ window.__ModuleLoader__.load({
                 disabled: selected.size === 0 || loading,
                 onClick: exportPack,
               },
-              t('exportAction'),
+              t(infoOnly ? 'exportInfoAction' : 'exportAction'),
             ),
           ),
         );
@@ -692,7 +762,7 @@ window.__ModuleLoader__.load({
                   t('chooseFile'),
                   h('input', {
                     type: 'file',
-                    accept: '.tgz,.tar.gz,application/gzip',
+                    accept: '.tgz,.tar.gz,application/gzip,.txt,text/plain',
                     style: { display: 'none' },
                     onChange: (event) => {
                       const next = event.target.files && event.target.files[0];
@@ -722,6 +792,9 @@ window.__ModuleLoader__.load({
 
       function renderPreview() {
         const source = pack.source || {};
+        const isList = pack.kind === 'list';
+        const counts = pack.counts || {};
+        const notBundles = isList ? Math.max(0, (counts.incompatible || 0) - (counts.invalid || 0)) : 0;
         const sourceText = [
           source.profile ? `${t('envProfile')} ${source.profile}` : null,
           source.dshVersion ? `DSH ${source.dshVersion}` : null,
@@ -740,15 +813,28 @@ window.__ModuleLoader__.load({
             'div',
             { style: styles.cardHead },
             h('span', { style: styles.cardTitle }, t('previewTitle')),
+            isList ? h(Badge, { kind: 'muted' }, t('listKind')) : null,
             sourceText ? h('span', { style: styles.cardHint }, `${t('previewFrom')} ${sourceText}`) : null,
           ),
           h(
             'div',
             { style: styles.envRow },
-            h(Badge, { kind: 'ok' }, t('countCompatible', { count: pack.counts?.compatible || 0 })),
-            h(Badge, { kind: 'warn' }, t('countInstalled', { count: pack.counts?.installed || 0 })),
-            h(Badge, { kind: 'err' }, t('countIncompatible', { count: pack.counts?.incompatible || 0 })),
-            h(Badge, { kind: 'muted' }, t('countSkipped', { count: pack.counts?.skipped || 0 })),
+            h(Badge, { kind: 'ok' }, t('countCompatible', { count: counts.compatible || 0 })),
+            h(Badge, { kind: 'warn' }, t('countInstalled', { count: counts.installed || 0 })),
+            !isList || notBundles > 0
+              ? h(
+                  Badge,
+                  { kind: 'err' },
+                  t('countIncompatible', { count: isList ? notBundles : counts.incompatible || 0 }),
+                )
+              : null,
+            isList && (counts.invalid || 0) > 0
+              ? h(Badge, { kind: 'err' }, t('countInvalid', { count: counts.invalid }))
+              : null,
+            h(Badge, { kind: 'muted' }, t('countSkipped', { count: counts.skipped || 0 })),
+            isList && (counts.latest || 0) > 0
+              ? h(Badge, { kind: 'muted' }, t('countLatest', { count: counts.latest }))
+              : null,
           ),
           (pack.warnings || []).length > 0
             ? h(
@@ -783,6 +869,9 @@ window.__ModuleLoader__.load({
                     { style: styles.nameLine },
                     h('span', { style: styles.name }, plugin.name),
                     h('span', { style: styles.version }, plugin.version || '—'),
+                    isList && plugin.installable && !plugin.pinned
+                      ? h(Badge, { kind: 'muted' }, t('latestBadge'))
+                      : null,
                     h(Badge, { kind: view.kind }, view.label),
                     plugin.currentVersion && plugin.currentVersion !== plugin.version
                       ? h(
@@ -797,7 +886,9 @@ window.__ModuleLoader__.load({
                     ? h('div', { style: styles.reason }, plugin.warnings.join('；'))
                     : null,
                 ),
-                h('span', { style: styles.muted }, plugin.enabled ? t('enabled') : t('disabled')),
+                plugin.enabled === null
+                  ? h('span', { style: styles.version }, isList ? 'npm' : '')
+                  : h('span', { style: styles.muted }, plugin.enabled ? t('enabled') : t('disabled')),
               );
             }),
           ),
@@ -836,7 +927,7 @@ window.__ModuleLoader__.load({
               busy === 'install' ? t('installing') : t('installAction', { count: selectableCount }),
             ),
           ),
-          h('div', { style: styles.muted }, t('installHint')),
+          h('div', { style: styles.muted }, isList ? t('infoImportHint') : t('installHint')),
         );
       }
 

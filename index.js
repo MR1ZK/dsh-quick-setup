@@ -3,9 +3,14 @@
  *
  * Exposes four same-origin endpoints used by the settings page:
  *   GET  /dsh-quick-setup/api/status   environment + installed third-party bundles
- *   GET  /dsh-quick-setup/api/export   stream a .dshpack.tgz of selected bundles
- *   POST /dsh-quick-setup/api/upload   receive and inspect a pack
- *   POST /dsh-quick-setup/api/install  install one selected pack entry
+ *   GET  /dsh-quick-setup/api/export   stream a .dshpack.tgz, or a .plugins.txt list
+ *   POST /dsh-quick-setup/api/upload   receive and inspect a pack or a plugin list
+ *   POST /dsh-quick-setup/api/install  install one selected pack or list entry
+ *
+ * Two export formats share the endpoints. A pack carries each plugin's code and
+ * installs from a local tarball; a plugin list carries only names and versions
+ * (`name@version`, or `name` for the `latest` tag) and installs every entry
+ * from the npm registry through `pluginManager.installBundle(spec)`.
  *
  * The UI installs entries one request at a time. Installing a bundle makes DSH
  * hot-reload the composition (and therefore this plugin), so a long-lived
@@ -17,7 +22,7 @@
  */
 
 import { createReadStream, createWriteStream, readFileSync } from 'node:fs';
-import { mkdir, readFile, readdir, realpath, rm, stat, unlink } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { Transform } from 'node:stream';
@@ -25,6 +30,14 @@ import { pipeline } from 'node:stream/promises';
 import { writeTarGz } from './lib/tar.js';
 import { extractTarGz } from './lib/tar-extract.js';
 import { compareVersions, isValidRange, satisfies } from './lib/range.js';
+import {
+  LIST_FORMAT,
+  LIST_VERSION,
+  MAX_LIST_BYTES,
+  formatPluginList,
+  parsePluginList,
+  specOf,
+} from './lib/plugin-list.js';
 
 const SELF = 'dsh-quick-setup';
 const PACK_FORMAT = 'dsh-quick-setup-pack';
@@ -33,6 +46,8 @@ const API_PREFIX = '/dsh-quick-setup/api';
 const MAX_UPLOAD = 1024 * 1024 * 1024;
 const MAX_MANIFEST = 4 * 1024 * 1024;
 const UPLOAD_TTL = 24 * 60 * 60 * 1000;
+const INSPECT_TIMEOUT = 15000;
+const INSPECT_CONCURRENCY = 4;
 
 export const name = SELF;
 export const inject = ['webServer', 'pluginManager', 'profileContext'];
@@ -229,19 +244,42 @@ export function apply(ctx) {
     });
   }
 
-  async function receiveLimited(request, destination, limit) {
+  /**
+   * Stream the request body to `destination` and decide from its first bytes
+   * whether it is a gzip pack or a UTF-8 plugin list. The size limit follows
+   * that decision, so a text list can never fill the disk.
+   *
+   * @returns {Promise<{kind: 'pack' | 'list', bytes: number}>}
+   */
+  async function receiveUpload(request, destination) {
     let total = 0;
+    let kind = null;
     const limiter = new Transform({
       transform(chunk, _encoding, callback) {
+        if (kind === null && chunk.length >= 2) {
+          kind = chunk[0] === 0x1f && chunk[1] === 0x8b ? 'pack' : 'list';
+        }
         total += chunk.length;
+        const limit = kind === 'list' ? MAX_LIST_BYTES : MAX_UPLOAD;
         if (total > limit) {
-          callback(Object.assign(new Error('插件包超过 1 GiB 限制'), { statusCode: 413 }));
+          const message =
+            kind === 'list' ? '插件清单超过 1 MiB 限制' : '插件包超过 1 GiB 限制';
+          callback(Object.assign(new Error(message), { statusCode: 413 }));
           return;
         }
         callback(null, chunk);
       },
     });
     await pipeline(request, limiter, createWriteStream(destination));
+    return { kind: kind ?? 'list', bytes: total };
+  }
+
+  async function readMetaFile(work) {
+    try {
+      return JSON.parse(await readFile(path.join(work, 'meta.json'), 'utf8'));
+    } catch {
+      return null;
+    }
   }
 
   async function resolvePackageDir(bundleName) {
@@ -340,6 +378,7 @@ export function apply(ctx) {
       env,
       plugins,
       pack: { format: PACK_FORMAT, formatVersion: PACK_VERSION, maxUpload: MAX_UPLOAD },
+      list: { format: LIST_FORMAT, formatVersion: LIST_VERSION, maxUpload: MAX_LIST_BYTES },
     });
   }
 
@@ -353,6 +392,24 @@ export function apply(ctx) {
       (plugin) => plugin.available && (requested.length === 0 || requested.includes(plugin.name)),
     );
     if (chosen.length === 0) return fail(response, 400, '没有可导出的第三方插件');
+
+    if (url.searchParams.get('mode') === 'info') {
+      const text = formatPluginList({
+        entries: chosen.map((plugin) => ({ name: plugin.name, version: plugin.version })),
+        withVersion: url.searchParams.get('withVersion') !== '0',
+        env,
+      });
+      const filename = `dsh-quick-setup-${safeName(env.profile)}-${stamp()}.plugins.txt`;
+      response.writeHead(200, {
+        'content-type': 'text/plain; charset=utf-8',
+        'content-length': String(Buffer.byteLength(text)),
+        'content-disposition': `attachment; filename="${filename}"`,
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+      });
+      response.end(text);
+      return;
+    }
 
     const exportDirectory = path.join(cacheRoot, 'exports');
     await mkdir(exportDirectory, { recursive: true });
@@ -555,13 +612,214 @@ export function apply(ctx) {
       downgrade: plugins.filter((plugin) => plugin.status === 'downgrade').length,
       installed: plugins.filter((plugin) => plugin.status === 'installed').length,
       incompatible: plugins.filter((plugin) => plugin.status === 'incompatible').length,
+      invalid: 0,
+      latest: 0,
       skipped: plugins.filter((plugin) => !plugin.installable && plugin.status !== 'installed').length,
     };
 
     return {
+      kind: 'pack',
       createdAt: typeof manifest.createdAt === 'string' ? manifest.createdAt : null,
       source: publicSource(manifest.source),
       plugins,
+      warnings,
+      counts,
+    };
+  }
+
+  /**
+   * Inspect one npm spec without letting a slow registry lookup hold the
+   * upload request open: abort after INSPECT_TIMEOUT and answer with a warning
+   * while the install path remains available.
+   *
+   * @returns {Promise<{ok: true, value: any} | {ok: false, error?: unknown, reason?: 'timeout'}>}
+   */
+  function inspectEntry(spec) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const controller = new AbortController();
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        controller.abort();
+        finish({ ok: false, reason: 'timeout' });
+      }, INSPECT_TIMEOUT);
+      timer.unref?.();
+      pluginManager.inspect(spec, undefined, controller.signal).then(
+        (value) => finish({ ok: true, value }),
+        (error) => finish({ ok: false, error }),
+      );
+    });
+  }
+
+  async function mapWithConcurrency(items, limit, worker) {
+    const results = new Array(items.length);
+    let next = 0;
+    const run = async () => {
+      while (next < items.length) {
+        const index = next;
+        next += 1;
+        results[index] = await worker(items[index], index);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+    return results;
+  }
+
+  /**
+   * Preview a `.plugins.txt` list: local checks first, then one `inspect` per
+   * entry that would actually be installed (already-installed entries need no
+   * registry lookup). Compatibility is re-checked by `installBundle` itself.
+   */
+  async function buildInfoPreview(parsed) {
+    const current = await installedMap();
+    const plugins = [];
+    const warnings = [...parsed.warnings];
+    const pending = [];
+
+    for (const entry of parsed.entries) {
+      const installed = current.get(entry.name);
+      const installedVersion = typeof installed?.version === 'string' ? installed.version : null;
+      const plugin = {
+        name: entry.name,
+        version: entry.version,
+        pinned: Boolean(entry.version),
+        resolvedVersion: null,
+        description: null,
+        status: 'compatible',
+        reason: null,
+        installable: true,
+        selectedByDefault: false,
+        enabled: null,
+        dir: null,
+        currentVersion: installed?.installed ? installedVersion : null,
+        currentEnabled: installed?.installed ? installed.enabled !== false : null,
+        requirements: null,
+        warnings: [],
+      };
+
+      if (entry.name === SELF) {
+        plugin.status = 'self';
+        plugin.installable = false;
+        plugin.reason = '清单中的 dsh-quick-setup 需要在目标实例手动安装，已跳过';
+      } else if (installed?.installed) {
+        plugin.status = 'installed';
+        if (entry.version && installedVersion) {
+          const diff = compareVersions(entry.version, installedVersion);
+          if (diff === 0) {
+            plugin.reason = '已安装相同版本，已跳过';
+          } else {
+            plugin.status = diff < 0 ? 'downgrade' : 'upgrade';
+            plugin.installable = false;
+            plugin.reason = `已安装 ${installedVersion}，清单为 ${entry.version}；为避免覆盖现有配置，快速安装不会自动替换同名插件，请先在插件管理中移除它`;
+          }
+        } else if (!entry.version) {
+          plugin.reason = '已安装；清单未记录版本，不会自动升级';
+        } else {
+          plugin.reason = '已安装，已跳过';
+        }
+      } else {
+        pending.push(plugin);
+      }
+      plugins.push(plugin);
+    }
+
+    if (pending.length > 0) {
+      if (typeof pluginManager.inspect === 'function') {
+        await mapWithConcurrency(pending, INSPECT_CONCURRENCY, async (row) => {
+          const spec = specOf({ name: row.name, version: row.version });
+          const outcome = await inspectEntry(spec);
+          if (!outcome.ok) {
+            const why =
+              outcome.reason === 'timeout'
+                ? '校验超时'
+                : outcome.error?.message ?? String(outcome.error);
+            row.warnings.push(`无法向 npm 校验 ${spec}（${why}），安装时会再试`);
+            return;
+          }
+          const inspection = outcome.value;
+          if (!inspection || typeof inspection !== 'object') return;
+          if (inspection.status === 'accepted') {
+            // `inspect` already refused non-bundles for registry specs.
+            if (typeof inspection.version === 'string') {
+              if (!row.pinned) row.resolvedVersion = inspection.version;
+              row.version = row.pinned ? row.version : inspection.version;
+            }
+            row.description = typeof inspection.description === 'string' ? inspection.description : null;
+            return;
+          }
+          const reason = typeof inspection.reason === 'string' ? inspection.reason : '';
+          switch (inspection.problem) {
+            case 'not-found':
+              row.status = 'invalid';
+              row.installable = false;
+              row.reason = `npm 上没有找到 ${spec}${reason ? `：${reason}` : ''}`;
+              break;
+            case 'not-a-bundle':
+              row.status = 'not-bundle';
+              row.installable = false;
+              row.reason = `${row.name} 不是 DSH 插件（package.json 缺少 dsh.bundle）`;
+              break;
+            case 'network':
+            case 'timeout':
+              row.warnings.push(`无法连接 npm 校验 ${spec}，安装时会再试${reason ? `：${reason}` : ''}`);
+              break;
+            case 'already-installed':
+              row.status = 'installed';
+              row.reason = '插件已经安装，已跳过';
+              break;
+            default:
+              row.status = 'invalid';
+              row.installable = false;
+              row.reason = `无法校验 ${spec}${reason ? `：${reason}` : ''}`;
+          }
+        });
+      } else {
+        warnings.push('当前 DSH 插件管理器不支持 npm 预校验，导入时会直接安装');
+      }
+    }
+
+    for (const plugin of plugins) {
+      if (plugin.status === 'compatible') {
+        plugin.reason = plugin.pinned
+          ? `将从 npm 安装 ${specOf({ name: plugin.name, version: plugin.version })}`
+          : `将从 npm 安装最新的 ${plugin.name}`;
+      }
+      plugin.selectedByDefault = plugin.status === 'compatible' || plugin.status === 'installed';
+      if (plugin.warnings.length > 0) warnings.push(`${plugin.name}：${plugin.warnings.join('；')}`);
+    }
+
+    const counts = {
+      total: plugins.length,
+      compatible: plugins.filter((plugin) => plugin.status === 'compatible').length,
+      upgrade: plugins.filter((plugin) => plugin.status === 'upgrade').length,
+      downgrade: plugins.filter((plugin) => plugin.status === 'downgrade').length,
+      installed: plugins.filter((plugin) => plugin.status === 'installed').length,
+      incompatible:
+        plugins.filter((plugin) => plugin.status === 'invalid' || plugin.status === 'not-bundle').length,
+      invalid: plugins.filter((plugin) => plugin.status === 'invalid').length,
+      latest: plugins.filter((plugin) => plugin.installable && !plugin.pinned).length,
+      skipped: plugins.filter((plugin) => !plugin.installable && plugin.status !== 'installed').length,
+    };
+
+    return {
+      kind: 'list',
+      createdAt: parsed.source.exportedAt ?? null,
+      source: {
+        profile: parsed.source.profile ?? null,
+        dshVersion: parsed.source.dshVersion ?? null,
+        platform: null,
+        arch: null,
+        node: null,
+        electron: null,
+        generatedAt: parsed.source.exportedAt ?? null,
+      },
+      plugins,
+      formatVersion: parsed.formatVersion,
       warnings,
       counts,
     };
@@ -573,18 +831,117 @@ export function apply(ctx) {
     const uploadId = randomBytes(12).toString('hex');
     const work = path.join(cacheRoot, 'uploads', uploadId);
     await mkdir(work, { recursive: true });
-    const archive = path.join(work, 'pack.tgz');
+    const file = path.join(work, 'upload.bin');
     try {
-      await receiveLimited(request, archive, MAX_UPLOAD);
+      const { kind } = await receiveUpload(request, file);
+      if (kind === 'list') {
+        const parsed = parsePluginList(await readFile(file, 'utf8'));
+        const preview = await buildInfoPreview(parsed);
+        await writeFile(
+          path.join(work, 'meta.json'),
+          `${JSON.stringify(
+            {
+              kind: 'list',
+              entries: parsed.entries,
+              source: parsed.source,
+              createdAt: new Date().toISOString(),
+              preview: Object.fromEntries(
+                (preview.plugins || []).map((plugin) => [
+                  plugin.name,
+                  { status: plugin.status, reason: plugin.reason ?? null },
+                ]),
+              ),
+            },
+            null,
+            2,
+          )}\n`,
+        );
+        json(response, 200, { ok: true, uploadId, manifest: preview });
+        return;
+      }
       const unpacked = path.join(work, 'unpacked');
       await mkdir(unpacked, { recursive: true });
-      await extractTarGz(archive, unpacked);
+      await extractTarGz(file, unpacked);
       const manifest = await parseManifest(unpacked);
       const preview = await buildPreview(unpacked, manifest);
       json(response, 200, { ok: true, uploadId, manifest: preview });
     } catch (error) {
       await rm(work, { recursive: true, force: true }).catch(() => {});
       fail(response, 400, `导入失败：${error.message}`);
+    }
+  }
+
+  /**
+   * Install one entry of a `.plugins.txt` list from the npm registry.
+   *
+   * The text carries no package manifest, so engines/peers are checked by
+   * `installBundle` itself; this handler only enforces the same "never replace
+   * an installed plugin automatically" rule the pack path uses.
+   */
+  async function installListEntry(response, meta, name) {
+    const entries = Array.isArray(meta.entries) ? meta.entries : [];
+    const entry = entries.find((item) => item && item.name === name);
+    if (!entry) return fail(response, 404, '插件清单中没有这个插件');
+    // The preview already ruled some entries out (missing on npm, not a bundle,
+    // or the plugin itself). Reject them here too so a direct API call cannot
+    // bypass the UI and make pnpm chase a package that does not exist.
+    const verdict = meta.preview?.[name];
+    if (verdict && (verdict.status === 'invalid' || verdict.status === 'not-bundle' || verdict.status === 'self')) {
+      return fail(response, 409, `插件清单中的 ${name} 在检查时被标记为不可安装：${verdict.reason ?? verdict.status}`);
+    }
+    const version = typeof entry.version === 'string' && entry.version !== '' ? entry.version : null;
+    let current = (await installedMap().catch(() => new Map())).get(name);
+    if (current?.installed) {
+      return json(response, 200, {
+        ok: true,
+        result: {
+          name,
+          action: 'skip',
+          ok: true,
+          reason: version ? '已安装同版本或其它版本，不会自动替换同名插件' : '已安装；清单未记录版本，不会自动升级',
+          version: current.version ?? version,
+          application: 'applied',
+        },
+      });
+    }
+
+    const spec = version ? `${name}@${version}` : name;
+    try {
+      const result = await pluginManager.installBundle(spec, { enabled: true });
+      const ok = !result?.error && result?.application !== 'failed';
+      return json(response, 200, {
+        ok,
+        result: {
+          name,
+          action: 'install',
+          ok,
+          spec,
+          application: result?.application ?? null,
+          version: result?.version ?? version,
+          error: errorInfo(result?.error),
+          warnings: Array.isArray(result?.warnings) ? result.warnings : [],
+          restartReason: result?.restartReason ?? null,
+        },
+        error: ok ? null : errorInfo(result?.error)?.message ?? '安装失败',
+      });
+    } catch (error) {
+      if (error?.code === 'already-installed') {
+        current = (await installedMap().catch(() => new Map())).get(name);
+        if (current?.installed) {
+          return json(response, 200, {
+            ok: true,
+            result: {
+              name,
+              action: 'skip',
+              ok: true,
+              reason: '同名插件已经安装',
+              version: current.version ?? version,
+              application: 'applied',
+            },
+          });
+        }
+      }
+      return json(response, 200, { ok: false, error: errorInfo(error)?.message ?? String(error) });
     }
   }
 
@@ -604,10 +961,15 @@ export function apply(ctx) {
     if (name.trim() === '') return fail(response, 400, '没有选择要安装的插件');
 
     const work = path.join(cacheRoot, 'uploads', uploadId);
-    const unpacked = path.join(work, 'unpacked');
-    const manifestInfo = await stat(path.join(work, 'pack.tgz')).catch(() => null);
-    if (!manifestInfo) return fail(response, 404, '上传记录不存在或已过期，请重新上传插件包');
+    const uploadInfo = await stat(path.join(work, 'upload.bin')).catch(() => null);
+    if (!uploadInfo) {
+      return fail(response, 404, '上传记录不存在或已过期，请重新上传插件包或插件清单');
+    }
 
+    const meta = await readMetaFile(work);
+    if (meta?.kind === 'list') return installListEntry(response, meta, name);
+
+    const unpacked = path.join(work, 'unpacked');
     let manifest;
     try {
       manifest = await parseManifest(unpacked);
