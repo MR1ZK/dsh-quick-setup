@@ -23,6 +23,15 @@ window.__ModuleLoader__.load({
         includeVersion: '包含当前版本号',
         infoOnlyHint:
           '导出为 .plugins.txt 文本，只写入包名和版本号，不含插件代码；导入时逐个从 npm 安装。',
+        includeConfig: '同时备份插件配置',
+        includeConfigHint:
+          '把 cordis.patch.yml 中属于所选插件的配置条目一并写入插件包；配置可能包含 API Key 等敏感信息。',
+        configBadge: '含配置 {count}',
+        countConfigBadge: '带配置的插件 {count}',
+        configRestored: '已恢复 {count} 条配置',
+        configUntouched: '配置已存在，跳过 {count} 条',
+        configFailed: '配置恢复失败：{message}',
+        configRestart: '插件配置已写入 cordis.patch.yml，重启 DSH 后生效。',
         exportInfoAction: '导出插件信息',
         selectAll: '全选',
         selectNone: '全不选',
@@ -31,7 +40,7 @@ window.__ModuleLoader__.load({
         loading: '正在读取插件列表…',
         importTitle: '导入插件包',
         importHint:
-          '支持 .dshpack.tgz 插件包和 .plugins.txt 插件信息清单。插件包只包含插件代码，不包含账号、密钥、聊天记录或设置；兼容性会在导入时重新校验。',
+          '支持 .dshpack.tgz 插件包和 .plugins.txt 插件信息清单。插件包默认只包含插件代码，不包含账号、密钥、聊天记录；导出时勾选「同时备份插件配置」才会带上 cordis.patch.yml 的配置条目，兼容性会在导入时重新校验。',
         chooseFile: '选择 .dshpack.tgz 或 .plugins.txt',
         noFile: '尚未选择文件',
         checkAction: '检查兼容性',
@@ -99,6 +108,15 @@ window.__ModuleLoader__.load({
         includeVersion: 'Include current version',
         infoOnlyHint:
           'Writes a .plugins.txt text with package names and versions only — no plugin code. Import installs each entry from npm.',
+        includeConfig: 'Also back up plugin configuration',
+        includeConfigHint:
+          'Copies the cordis.patch.yml entries that belong to the selected plugins into the pack. Configuration may contain secrets such as API keys.',
+        configBadge: 'Config ×{count}',
+        countConfigBadge: '{count} plugins with config',
+        configRestored: 'Restored {count} config entries',
+        configUntouched: 'Config already present, skipped {count}',
+        configFailed: 'Could not restore configuration: {message}',
+        configRestart: 'Plugin configuration was written to cordis.patch.yml and takes effect after a DSH restart.',
         exportInfoAction: 'Export plugin info',
         selectAll: 'Select all',
         selectNone: 'Select none',
@@ -107,7 +125,7 @@ window.__ModuleLoader__.load({
         loading: 'Reading installed plugins…',
         importTitle: 'Import a plugin pack',
         importHint:
-          'Accepts .dshpack.tgz packs and .plugins.txt lists. A pack contains plugin code only — no accounts, secrets, conversations or settings. Compatibility is re-checked on import.',
+          'Accepts .dshpack.tgz packs and .plugins.txt lists. A pack contains plugin code only — accounts, secrets and conversations are never included. Check "Also back up plugin configuration" when exporting to carry the cordis.patch.yml entries; compatibility is re-checked on import.',
         chooseFile: 'Choose .dshpack.tgz or .plugins.txt',
         noFile: 'No file selected',
         checkAction: 'Check compatibility',
@@ -388,6 +406,7 @@ window.__ModuleLoader__.load({
       const [selected, setSelected] = React.useState(() => new Set());
       const [infoOnly, setInfoOnly] = React.useState(false);
       const [withVersion, setWithVersion] = React.useState(true);
+      const [includeConfig, setIncludeConfig] = React.useState(false);
       const [loading, setLoading] = React.useState(true);
       const [error, setError] = React.useState(null);
       const [file, setFile] = React.useState(null);
@@ -486,6 +505,8 @@ window.__ModuleLoader__.load({
         if (infoOnly) {
           params.set('mode', 'info');
           params.set('withVersion', withVersion ? '1' : '0');
+        } else if (includeConfig) {
+          params.set('config', '1');
         }
         window.location.assign(`${API}/export?${params.toString()}`);
       }
@@ -709,6 +730,19 @@ window.__ModuleLoader__.load({
                   }),
                   t('includeVersion'),
                 )
+              : h(
+                  'label',
+                  { style: styles.option },
+                  h('input', {
+                    type: 'checkbox',
+                    style: styles.optionCheck,
+                    checked: includeConfig,
+                    onChange: (event) => setIncludeConfig(event.target.checked),
+                  }),
+                  t('includeConfig'),
+                ),
+            !infoOnly && includeConfig
+              ? h('span', { style: styles.muted }, t('includeConfigHint'))
               : null,
             infoOnly ? h('span', { style: styles.muted }, t('infoOnlyHint')) : null,
           ),
@@ -832,6 +866,9 @@ window.__ModuleLoader__.load({
               ? h(Badge, { kind: 'err' }, t('countInvalid', { count: counts.invalid }))
               : null,
             h(Badge, { kind: 'muted' }, t('countSkipped', { count: counts.skipped || 0 })),
+            !isList && (counts.config || 0) > 0
+              ? h(Badge, { kind: 'muted' }, t('countConfigBadge', { count: counts.config }))
+              : null,
             isList && (counts.latest || 0) > 0
               ? h(Badge, { kind: 'muted' }, t('countLatest', { count: counts.latest }))
               : null,
@@ -869,6 +906,9 @@ window.__ModuleLoader__.load({
                     { style: styles.nameLine },
                     h('span', { style: styles.name }, plugin.name),
                     h('span', { style: styles.version }, plugin.version || '—'),
+                    plugin.configCount > 0
+                      ? h(Badge, { kind: 'muted' }, t('configBadge', { count: plugin.configCount }))
+                      : null,
                     isList && plugin.installable && !plugin.pinned
                       ? h(Badge, { kind: 'muted' }, t('latestBadge'))
                       : null,
@@ -935,6 +975,7 @@ window.__ModuleLoader__.load({
         const total = job.total || 0;
         const doneCount = job.done ? total : job.index || 0;
         const percent = total > 0 ? Math.max(3, Math.round((doneCount / total) * 100)) : 5;
+        const restoredConfig = (job.results || []).some((result) => result.config && result.config.restored > 0);
         return h(
           'div',
           { style: styles.card },
@@ -1002,6 +1043,23 @@ window.__ModuleLoader__.load({
                               .join('；'),
                           )
                         : null,
+                      result.config && result.config.restored > 0
+                        ? h(
+                            'div',
+                            { style: styles.reason },
+                            t('configRestored', { count: result.config.restored }),
+                          )
+                        : null,
+                      result.config && result.config.skipped > 0
+                        ? h(
+                            'div',
+                            { style: styles.reason },
+                            t('configUntouched', { count: result.config.skipped }),
+                          )
+                        : null,
+                      result.configError
+                        ? h('div', { style: styles.reason }, t('configFailed', { message: result.configError }))
+                        : null,
                       result.warnings && result.warnings.length > 0
                         ? h('div', { style: styles.reason }, result.warnings.join('；'))
                         : null,
@@ -1011,6 +1069,7 @@ window.__ModuleLoader__.load({
               )
             : null,
           job.error ? h('div', { style: styles.error }, job.error.message || String(job.error)) : null,
+          restoredConfig ? h('div', { style: styles.notice }, t('configRestart')) : null,
           job.done && job.restartRequired ? h('div', { style: styles.notice }, t('jobRestart')) : null,
           h(
             'div',

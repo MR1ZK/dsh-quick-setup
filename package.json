@@ -1,7 +1,7 @@
 {
   "name": "dsh-quick-setup",
-  "version": "0.2.0",
-  "description": "Export installed third-party DSH plugins as a portable pack or a name@version list, validate compatibility on another instance, and batch-install them. · 导出本机第三方 DSH 插件为便携插件包或版本清单，在另一实例校验兼容性后批量安装。",
+  "version": "0.3.0",
+  "description": "Export installed third-party DSH plugins as a portable pack (optionally with their cordis.patch.yml configuration) or a name@version list, validate compatibility on another instance, and batch-install them. · 导出本机第三方 DSH 插件为便携插件包（可带插件配置）或版本清单，在另一实例校验兼容性后批量安装。",
   "type": "module",
   "main": "index.js",
   "license": "MIT",

@@ -4,6 +4,8 @@
 
 除了携带插件代码的完整 `.dshpack.tgz`，也支持只导出**插件信息清单**（`.plugins.txt`）：清单只记录插件名与版本号（或不带版本号），导入时逐个从 npm 安装对应版本，体积只有几百字节，适合在不同机器间快速对齐插件集合。
 
+完整插件包还可以选择「同时备份插件配置」：把本 profile 的 `cordis.patch.yml` 里属于所选插件的配置条目原样写进包内，导入并安装插件后自动合并回目标 profile 的同名文件，省去重新填写一遍设置。
+
 适合这些场景：
 
 - 多台电脑之间同步 DSH 插件；
@@ -18,6 +20,7 @@
 2. 只保留**第三方、已安装**的 bundle；官方内置 bundle 和 `dsh-quick-setup` 自身不会被打包。
 3. 两种导出形式：
    - **完整插件包**（默认）：把每个插件的包目录（跳过 `node_modules`、`.git` 等）原样写入外层归档，再与 `dsh-quick-setup-pack.json` 清单一起打成 `.dshpack.tgz`。插件包的来源环境会写入清单：DSH 版本、profile 名、Node、Electron、OS、CPU 架构、打包时间。
+     - 勾选「同时备份插件配置」后，还会读取 `<profile>/cordis.patch.yml`，按插件名（含 `dsh-ops/shell` 这类子路径条目）挑出带 `config:` 或 `disabled: true` 的条目，连同 id/name 一起原样写入清单的 `config.entries`；YAML 注释与 `!!js` 表达式不做解析、不丢格式。
    - **仅插件信息**：勾选“仅导出插件信息”后，生成一个 UTF-8 文本 `.plugins.txt`，头部是 `# dsh-quick-setup/plugins@1` 格式标记、profile、DSH 版本与导出时间，正文每行一个 `插件名@版本号`。子选项“包含当前版本号”（默认勾选）决定正文格式：
      - 勾选：`name@1.2.3`，导入时从 npm 安装这个**精确版本**；
      - 不勾选：只写 `name`，导入时安装 npm 上的 **latest**。
@@ -33,6 +36,7 @@
 2. 在设置页展示可安装、已安装、不兼容、版本冲突四类结果；**只有用户确认后**才安装。
 3. 完整插件包里的每个选中插件以 `file:` tarball 形式交给 `pluginManager.installBundle()`；插件信息清单里的每个选中条目以 npm spec（`name@version` 或裸 `name`，即 latest）交给同一个接口，由 DSH 自己执行 pnpm 安装、构建脚本审批与最终兼容性校验；本插件不直接改写 profile 的 `package.json`，也不自行运行包管理器。
 4. 安装一个插件后 DSH 会热重载组合（本插件的 Host 半也会被重启），因此界面按“一次请求装一个”的顺序逐个推进，并在响应被热重载截断时通过状态接口核对实际结果；不会因为一次重载丢掉整批任务。
+5. 插件包带了配置时，每个插件安装成功（或本已安装、状态一致）后，把它的配置条目合并回 `<profile>/cordis.patch.yml`：**按 id 或 name 去重，目标里已存在的条目一律跳过**，不会覆盖用户后来的修改；写文件用临时文件 + rename 原子替换。某个插件的配置恢复失败只会显示提示，不会让已成功的安装变成失败。配置在 DSH 重载组合后生效，因此通常需要再重启一次 DSH。
 
 ## 安装
 
@@ -47,6 +51,7 @@ plugin_manager action=install_bundle target=C:\path\to\dsh-quick-setup
 ## 使用
 
 1. **导出**：打开设置页，勾选要带走的插件，点“导出插件包”，得到一个 `dsh-quick-setup-<profile>-<时间>.dshpack.tgz`。
+   - 想连同插件设置一起带走时，勾选「同时备份插件配置」（默认不勾选，因为配置里可能有密钥）；
    - 如果只想同步插件名和版本，勾选“仅导出插件信息”，得到 `dsh-quick-setup-<profile>-<时间>.plugins.txt`；
    - 该模式下可再选择“包含当前版本号”（默认勾选）：取消勾选则清单只写插件名，目标实例安装 npm 上的 latest。
 2. **传输**：U 盘、scp、网盘均可。
@@ -55,12 +60,25 @@ plugin_manager action=install_bundle target=C:\path\to\dsh-quick-setup
 
 ## 插件包内容与边界
 
-插件包只包含插件**代码与包元数据**，不包含：
+插件包默认只包含插件**代码与包元数据**，不包含：
 
 - DSH 账号、API Key、模型凭据；
 - 聊天记录、会话数据库、工作区文件；
-- 插件自己的设置值（例如音乐播放器的目录配置）；
+- 插件自己的设置值（除非显式勾选「同时备份插件配置」）；
 - 原实例的 `node_modules`（避免绝对软链与平台相关二进制；依赖由目标实例的包管理器重新解析）。
+
+### 插件配置备份的范围
+
+勾选「同时备份插件配置」后，包里会额外带上一份 `config` 字段，内容是 `cordis.patch.yml` 中属于所选插件的**补丁条目**（`- id:` / `name:` / `config:` 的原样 YAML 文本）：
+
+- 这是 DSH 官方配置编辑器写入的设置，即用户在设置页里改过的值；插件自己的默认值来自包内代码，不在备份范围。
+- 匹配按包名进行，`dsh-ops/shell` 这样的子路径条目算作 `dsh-ops` 的一部分。
+- 只备份带 `config:` 或 `disabled: true` 的条目；没有配置的插件不会产生空条目。
+- **配置里可能有 API Key、路径等敏感信息**。插件包本身没有任何加密，请像对待密钥一样保管和传输。
+- 导入时逐条合并：目标 `cordis.patch.yml` 中已有相同 id 或 name 的条目会被跳过（保留目标机器上的现有值），其余追加写入。配置在组合重载后生效，通常需要重启 DSH。
+- 单个条目上限 128 KiB、总量 512 KiB、最多 200 条；超限的包会被拒绝导入，而不是截断。
+
+插件自己的私有存储（例如 `~/.dsh/music-player-prefs.json`、`localStorage` 中的状态）不在备份范围，需要单独复制。
 
 插件信息清单（`.plugins.txt`）**只有插件名和版本号**（或只有插件名），不含代码、描述与来源 registry；导入时目标实例必须能访问这些包所在的 npm registry（镜像、代理或私有 registry 需已在目标 profile 配置好）。
 
@@ -78,7 +96,7 @@ plugin_manager action=install_bundle target=C:\path\to\dsh-quick-setup
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | GET | `/dsh-quick-setup/api/status` | 当前环境 + 可导出的第三方插件 |
-| GET | `/dsh-quick-setup/api/export?plugin=<name>&plugin=…` | 流式下载完整插件包（无参数则导出全部） |
+| GET | `/dsh-quick-setup/api/export?plugin=<name>&plugin=…` | 流式下载完整插件包（无参数则导出全部；加 `config=1` 时附带 `cordis.patch.yml` 配置条目） |
 | GET | `/dsh-quick-setup/api/export?mode=info&withVersion=0\|1` | 下载插件信息清单（`text/plain`；`withVersion=0` 时只写插件名，默认带版本号） |
 | POST | `/dsh-quick-setup/api/upload` | 上传插件包（`application/gzip`）或插件清单（`text/plain`），生成兼容性预览 |
 | POST | `/dsh-quick-setup/api/install` | 安装**一个**选中条目（JSON：`{uploadId, name}`；清单条目按 `name@version` 或裸 `name` 装 npm 包） |
@@ -96,6 +114,6 @@ node scripts/smoke.mjs
 node scripts/smoke.mjs <profileDir>/node_modules/<plugin>
 ```
 
-smoke 会在临时目录生成一个只含 `package.json` 的假插件包，走一遍“打包 → 解包 → 清单校验”的闭环，并覆盖 `.plugins.txt` 的格式化/解析往返、带/不带版本号、CRLF/BOM/注释/重复/非法行容错、格式版本拒绝，不安装任何东西。
+smoke 会在临时目录生成一个只含 `package.json` 的假插件包，走一遍“打包 → 解包 → 清单校验”的闭环，并覆盖 `.plugins.txt` 的格式化/解析往返、带/不带版本号、CRLF/BOM/注释/重复/非法行容错、格式版本拒绝，以及配置备份：条目提取（注释/`!!js`/子路径/`disabled`）、合并去重、空 patch 的 `[]` 替换、大小与归属校验，不安装任何东西。
 
 - 在真实 Host 中验证时注意：`index.js`（Host 半）只在插件加载时执行，修改后需要重启 DSH 才会生效；`client.js` 走开发期热更新。可用 `curl`（GET）或页面操作验证，POST 需带 `x-dsh-quick-setup: 1`。

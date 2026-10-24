@@ -24,6 +24,16 @@ import {
   parsePluginList,
   specOf,
 } from '../lib/plugin-list.js';
+import {
+  CONFIG_FORMAT,
+  CONFIG_VERSION,
+  configEntriesOf,
+  extractPluginConfig,
+  mergePatchEntries,
+  normalizeConfig,
+  splitPatchEntries,
+  toManifestEntries,
+} from '../lib/patch-config.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = await mkdtemp(path.join(os.tmpdir(), 'dsh-quick-setup-smoke-'));
@@ -156,6 +166,126 @@ try {
   assert.equal(satisfies('1.3.0', '~1.2'), false);
   assert.equal(isValidRange('workspace:^'), false);
   assert.equal(isValidRange('not a range'), false);
+
+  // Config backup: copy the patch entries owned by the selected plugins.
+  const patch = [
+    '# profile patch: entries below are user configuration',
+    '- id: a-config',
+    '  name: example-plugin',
+    '  config:',
+    '    path: "C:\\\\tmp\\\\x"  # quoted value with a comment',
+    '- id: a-sub',
+    '  name: example-plugin/extra',
+    '  config: !!js { process: true }',
+    '- id: quoted',
+    '  name: "@scope/pkg"',
+    '  config:',
+    '    a: 1',
+    '- id: a-disabled',
+    '  name: example-plugin',
+    '  disabled: true',
+    '- id: other',
+    '  name: other-plugin',
+    '  config: {}',
+    '',
+  ].join('\n');
+  const sections = splitPatchEntries(patch);
+  assert.equal(sections.preamble.length, 1);
+  assert.equal(sections.entries.length, 5);
+  const picked = extractPluginConfig(patch, ['example-plugin', '@scope/pkg']);
+  assert.deepEqual(
+    picked.map((entry) => entry.id),
+    ['a-config', 'a-sub', 'quoted', 'a-disabled'],
+  );
+  assert.match(picked[0].yaml, /# quoted value with a comment/);
+  assert.match(picked[1].yaml, /!!js \{ process: true \}/);
+  assert.ok(picked[0].bytes > 0);
+  const manifestEntries = toManifestEntries(picked);
+  assert.equal(manifestEntries[0].bytes, undefined);
+  assert.equal(configEntriesOf(manifestEntries, 'example-plugin').length, 3);
+  assert.equal(configEntriesOf(manifestEntries, 'other-plugin').length, 0);
+  // Same id twice: the first copy wins, so a pack never repeats an entry.
+  const duplicated = extractPluginConfig(
+    '- id: same\n  name: example-plugin\n  config:\n    a: 1\n- id: same\n  name: example-plugin\n  config:\n    a: 2\n',
+    ['example-plugin'],
+  );
+  assert.equal(duplicated.length, 1);
+  assert.match(duplicated[0].yaml, /a: 1/);
+
+  // Merging restores missing entries and never overwrites existing ones.
+  const merged = mergePatchEntries(
+    '- id: existing\n  name: example-plugin\n  config:\n    keep: 1\n',
+    [
+      {
+        id: 'a-config',
+        name: 'other-plugin',
+        yaml: '- id: a-config\n  name: other-plugin\n  config:\n    applied: true',
+      },
+      {
+        id: 'existing',
+        name: 'other-plugin',
+        yaml: '- id: existing\n  name: other-plugin\n  config:\n    replaced: true',
+      },
+    ],
+  );
+  assert.equal(merged.appended, 1);
+  assert.equal(merged.skipped, 1);
+  assert.match(merged.text, /keep: 1/);
+  assert.match(merged.text, /applied: true/);
+  assert.doesNotMatch(merged.text, /replaced/);
+  // Existing entries are copied back verbatim, including the trailing entry.
+  assert.match(merged.text, /^- id: existing\n {2}name: example-plugin\n {2}config:\n {4}keep: 1/m);
+
+  // An empty `[]` patch becomes a proper sequence; the header stays on top.
+  const empty = mergePatchEntries('# header\n[]\n', [
+    { id: 'n', name: 'example-plugin', yaml: '- id: n\n  name: example-plugin\n  config:\n    a: 1' },
+  ]);
+  assert.equal(empty.appended, 1);
+  assert.match(empty.text, /^# header\n- id: n/m);
+  assert.doesNotMatch(empty.text, /^\[\]$/m);
+  // Nothing to append keeps the file byte-for-byte unchanged.
+  const untouched = mergePatchEntries('[]\n', [{ id: 'n', name: 'example-plugin', yaml: 'not-an-entry' }]);
+  assert.equal(untouched.appended, 0);
+  assert.equal(untouched.text, '[]\n');
+  // A CRLF patch keeps its line endings, and entries are re-wrapped accordingly.
+  const crlfKeep = mergePatchEntries(
+    '- id: keep\r\n  name: example-plugin\r\n  config:\r\n    x: 1\r\n',
+    [{ id: 'keep', name: 'example-plugin', yaml: '- id: keep\n  name: example-plugin' }],
+  );
+  assert.equal(crlfKeep.appended, 0);
+  assert.equal(crlfKeep.text, '- id: keep\r\n  name: example-plugin\r\n  config:\r\n    x: 1\r\n');
+  const crlf = mergePatchEntries('# header\r\n[]\r\n', [
+    { id: 'n', name: 'example-plugin', yaml: '- id: n\n  name: example-plugin\n  config:\n    a: 1' },
+  ]);
+  assert.equal(crlf.appended, 1);
+  assert.match(crlf.text, /^# header\r\n- id: n\r\n {2}name: example-plugin\r\n {2}config:\r\n {4}a: 1\r\n$/);
+  assert.doesNotMatch(crlf.text, /(?<!\r)\n/);
+
+  // Imported config is validated: structure, ownership, YAML shape and caps.
+  const normalized = normalizeConfig(
+    { entries: [{ id: 'x', name: 'example-plugin', yaml: '- id: x\n  name: example-plugin\n  config:\n    a: 1' }] },
+    ['example-plugin'],
+  );
+  assert.equal(normalized.format, CONFIG_FORMAT);
+  assert.equal(normalized.version, CONFIG_VERSION);
+  assert.equal(normalized.entries.length, 1);
+  assert.equal(normalizeConfig(undefined, ['example-plugin']), null);
+  assert.throws(
+    () => normalizeConfig({ entries: [{ name: 'other-plugin', yaml: '- id: o' }] }, ['example-plugin']),
+    /不属于包内插件/,
+  );
+  assert.throws(
+    () => normalizeConfig({ entries: [{ name: 'example-plugin', yaml: 'id: x' }] }, ['example-plugin']),
+    /不是补丁条目/,
+  );
+  assert.throws(
+    () =>
+      normalizeConfig(
+        { entries: Array.from({ length: 201 }, () => ({ name: 'example-plugin', yaml: '- id: x' })) },
+        ['example-plugin'],
+      ),
+    /超过 200 条/,
+  );
 
   console.log(`smoke ok · ${report.files} files · ${report.bytes} bytes · ${path.relative(here, archive)}`);
 

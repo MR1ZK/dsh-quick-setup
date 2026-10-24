@@ -12,6 +12,10 @@
  * (`name@version`, or `name` for the `latest` tag) and installs every entry
  * from the npm registry through `pluginManager.installBundle(spec)`.
  *
+ * A pack can optionally carry the plugin configuration found in the profile
+ * patch file (`cordis.patch.yml`). Entries are copied verbatim and appended back
+ * after an install, skipping entries whose id or name already exists.
+ *
  * The UI installs entries one request at a time. Installing a bundle makes DSH
  * hot-reload the composition (and therefore this plugin), so a long-lived
  * server-side batch job would lose its state after the first successful entry.
@@ -22,7 +26,7 @@
  */
 
 import { createReadStream, createWriteStream, readFileSync } from 'node:fs';
-import { mkdir, readFile, readdir, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { Transform } from 'node:stream';
@@ -38,6 +42,15 @@ import {
   parsePluginList,
   specOf,
 } from './lib/plugin-list.js';
+import {
+  CONFIG_FORMAT,
+  CONFIG_VERSION,
+  configEntriesOf,
+  extractPluginConfig,
+  mergePatchEntries,
+  normalizeConfig,
+  toManifestEntries,
+} from './lib/patch-config.js';
 
 const SELF = 'dsh-quick-setup';
 const PACK_FORMAT = 'dsh-quick-setup-pack';
@@ -450,6 +463,19 @@ export function apply(ctx) {
         source: env,
         plugins,
       };
+      if (url.searchParams.get('config') === '1') {
+        const patchFile = path.join(profile.dir, 'cordis.patch.yml');
+        const patchText = await readFile(patchFile, 'utf8').catch(() => '');
+        const configEntries = extractPluginConfig(
+          patchText,
+          plugins.map((plugin) => plugin.name),
+        );
+        manifest.config = {
+          format: CONFIG_FORMAT,
+          version: CONFIG_VERSION,
+          entries: toManifestEntries(configEntries),
+        };
+      }
       await writeTarGz(archive, {
         firstFiles: [
           { name: 'dsh-quick-setup-pack.json', data: `${JSON.stringify(manifest, null, 2)}\n` },
@@ -503,6 +529,10 @@ export function apply(ctx) {
       );
     }
     if (!Array.isArray(manifest.plugins)) throw new Error('插件包清单缺少 plugins');
+    manifest.config = normalizeConfig(
+      manifest.config,
+      manifest.plugins.map((plugin) => plugin?.name).filter((name) => typeof name === 'string'),
+    );
     return manifest;
   }
 
@@ -523,6 +553,7 @@ export function apply(ctx) {
     const current = await installedMap();
     const plugins = [];
     const warnings = [];
+    const backedUpConfig = Array.isArray(manifest.config?.entries) ? manifest.config.entries : [];
 
     for (const entry of manifest.plugins) {
       if (!entry || typeof entry.name !== 'string' || typeof entry.dir !== 'string') {
@@ -602,6 +633,7 @@ export function apply(ctx) {
         currentEnabled: installed?.installed ? installed.enabled !== false : null,
         requirements: requirementsOf(pkg),
         warnings: compatibility.warnings,
+        configCount: configEntriesOf(backedUpConfig, name).length,
       });
     }
 
@@ -612,6 +644,8 @@ export function apply(ctx) {
       downgrade: plugins.filter((plugin) => plugin.status === 'downgrade').length,
       installed: plugins.filter((plugin) => plugin.status === 'installed').length,
       incompatible: plugins.filter((plugin) => plugin.status === 'incompatible').length,
+      config: plugins.filter((plugin) => plugin.configCount > 0).length,
+      configEntries: backedUpConfig.length,
       invalid: 0,
       latest: 0,
       skipped: plugins.filter((plugin) => !plugin.installable && plugin.status !== 'installed').length,
@@ -945,6 +979,45 @@ export function apply(ctx) {
     }
   }
 
+  /**
+   * Appends the pack's backed-up configuration for one plugin to the profile
+   * patch file. Entries whose id or name already exists in the target patch are
+   * left alone, so repeated imports and local edits keep winning.
+   *
+   * @returns {Promise<null | {restored: number, skipped: number}>}
+   */
+  async function restorePluginConfig(manifest, pluginName) {
+    const entries = configEntriesOf(manifest?.config?.entries, pluginName);
+    if (entries.length === 0) return null;
+    const patchFile = path.join(profile.dir, 'cordis.patch.yml');
+    let current = '';
+    try {
+      current = await readFile(patchFile, 'utf8');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    const merged = mergePatchEntries(current, entries);
+    if (merged.appended === 0) return { restored: 0, skipped: merged.skipped };
+    const temp = `${patchFile}.${randomBytes(4).toString('hex')}.tmp`;
+    try {
+      await writeFile(temp, merged.text, 'utf8');
+      await rename(temp, patchFile);
+    } catch (error) {
+      await unlink(temp).catch(() => {});
+      throw error;
+    }
+    return { restored: merged.appended, skipped: merged.skipped };
+  }
+
+  /** Config restore must never turn a successful install into a failure. */
+  async function restoreConfigQuietly(manifest, pluginName) {
+    try {
+      return { config: await restorePluginConfig(manifest, pluginName), configError: null };
+    } catch (error) {
+      return { config: null, configError: errorInfo(error)?.message ?? String(error) };
+    }
+  }
+
   async function handleInstall(request, response) {
     if (request.method !== 'POST') return fail(response, 405, '只接受 POST');
     if (!postAllowed(request)) return fail(response, 403, '禁止跨站或未标记的请求');
@@ -992,6 +1065,7 @@ export function apply(ctx) {
         if (!current?.installed) {
           return json(response, 200, { ok: false, error: '插件状态已变化，请刷新后重试' });
         }
+        const restored = await restoreConfigQuietly(manifest, name);
         if ((current.enabled !== false) !== (plugin.enabled !== false)) {
           const result = await pluginManager.setBundleEnabled(name, plugin.enabled !== false);
           return json(response, 200, {
@@ -1002,6 +1076,7 @@ export function apply(ctx) {
               ok: true,
               application: result?.application ?? 'applied',
               version: current.version ?? plugin.version,
+              ...restored,
             },
           });
         }
@@ -1014,6 +1089,7 @@ export function apply(ctx) {
             reason: '已安装同版本且状态一致',
             version: current.version ?? plugin.version,
             application: 'applied',
+            ...restored,
           },
         });
       }
@@ -1030,6 +1106,7 @@ export function apply(ctx) {
         enabled: plugin.enabled !== false,
       });
       const ok = !result?.error && result?.application !== 'failed';
+      const restored = ok ? await restoreConfigQuietly(manifest, name) : { config: null, configError: null };
       return json(response, 200, {
         ok,
         result: {
@@ -1041,6 +1118,7 @@ export function apply(ctx) {
           error: errorInfo(result?.error),
           warnings: Array.isArray(result?.warnings) ? result.warnings : [],
           restartReason: result?.restartReason ?? null,
+          ...restored,
         },
         error: ok ? null : errorInfo(result?.error)?.message ?? '安装失败',
       });
@@ -1048,6 +1126,7 @@ export function apply(ctx) {
       if (error?.code === 'already-installed') {
         const current = (await installedMap().catch(() => new Map())).get(name);
         if (current?.version === plugin.version) {
+          const restored = await restoreConfigQuietly(manifest, name);
           return json(response, 200, {
             ok: true,
             result: {
@@ -1057,6 +1136,7 @@ export function apply(ctx) {
               reason: '同名同版本插件已经安装',
               version: plugin.version,
               application: 'applied',
+              ...restored,
             },
           });
         }
