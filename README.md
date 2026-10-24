@@ -117,3 +117,7 @@ node scripts/smoke.mjs <profileDir>/node_modules/<plugin>
 smoke 会在临时目录生成一个只含 `package.json` 的假插件包，走一遍“打包 → 解包 → 清单校验”的闭环，并覆盖 `.plugins.txt` 的格式化/解析往返、带/不带版本号、CRLF/BOM/注释/重复/非法行容错、格式版本拒绝，以及配置备份：条目提取（注释/`!!js`/子路径/`disabled`）、合并去重、空 patch 的 `[]` 替换、大小与归属校验，不安装任何东西。
 
 - 在真实 Host 中验证时注意：`index.js`（Host 半）只在插件加载时执行，修改后需要重启 DSH 才会生效；`client.js` 走开发期热更新。可用 `curl`（GET）或页面操作验证，POST 需带 `x-dsh-quick-setup: 1`。
+
+## 许可证
+
+本项目以 [MIT License](LICENSE) 开源。
