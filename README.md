@@ -121,3 +121,5 @@ smoke 会在临时目录生成一个只含 `package.json` 的假插件包，走�
 ## 许可证
 
 本项目以 [MIT License](LICENSE) 开源。
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
